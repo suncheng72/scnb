@@ -1,0 +1,1603 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0,user-scalable=no">
+<title>超级马里奥 · 高中知识大冒险</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  html,body{
+    width:100%;height:100%;background:#070a14;overflow:hidden;
+    font-family:'Segoe UI',system-ui,-apple-system,'PingFang SC','Microsoft YaHei',sans-serif;
+    -webkit-user-select:none;user-select:none;touch-action:none;
+  }
+  #stage{
+    position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);
+    width:min(100vw,calc(100vh*1.875));
+    height:min(53.33vw,100vh);
+    max-width:1600px;max-height:853px;
+  }
+  canvas{
+    width:100%;height:100%;display:block;border-radius:10px;
+    box-shadow:0 24px 80px rgba(0,0,0,.85),0 0 0 2px rgba(120,180,255,.12);
+    image-rendering:pixelated;
+  }
+  #touch{position:absolute;inset:0;pointer-events:none;display:none}
+  @media (pointer:coarse){#touch{display:block}}
+  #touch .pad{position:absolute;bottom:3%;display:flex;gap:14px;pointer-events:auto}
+  #touch .left{left:3%}
+  #touch .right{right:3%}
+  #touch button{
+    width:74px;height:74px;border-radius:50%;border:2px solid rgba(255,255,255,.35);
+    background:rgba(255,255,255,.14);color:#fff;font-size:22px;font-weight:700;
+    backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);
+    touch-action:none;outline:none;
+  }
+  #touch button:active{background:rgba(255,255,255,.4);transform:scale(.94)}
+</style>
+</head>
+<body>
+<div id="stage">
+  <canvas id="cv"></canvas>
+  <div id="touch">
+    <div class="pad left">
+      <button data-k="left">◀</button>
+      <button data-k="right">▶</button>
+    </div>
+    <div class="pad right">
+      <button data-k="jump">跳</button>
+    </div>
+  </div>
+</div>
+
+<script>
+/* =========================================================================
+   超级马里奥 · 高中知识大冒险
+   单文件 Canvas 游戏  ·  二段跳 + 阻尼手感版
+   ========================================================================= */
+
+/* ------------------------- 基础常量 ------------------------- */
+const W = 960, H = 512;
+const TILE = 32;
+const ROWS = H / TILE;
+const COLS = 210;
+
+const GRAVITY  = 0.80;
+const MAX_FALL = 16;
+
+/* ——— 水平移动：阻尼感参数 ——— */
+const ACCEL        = 0.42;   // 加速度（越小越沉）
+const MAX_RUN      = 4.40;   // 最大水平速度
+const AIR_CONTROL  = 0.65;   // 空中操控力系数
+const AIR_DRAG     = 0.995;  // 空中水平阻尼
+
+/* ——— 跳跃参数 ——— */
+const JUMP_V        = -14.5; // 一段跳初速度
+const JUMP_V_DOUBLE = -12.2; // 二段跳初速度（略弱，手感更好）
+const MAX_JUMPS     = 2;     // 最大跳跃次数（含二段跳）
+
+const GROUND_ROW = 14;
+
+/* ------------------------- Canvas ------------------------- */
+const canvas = document.getElementById('cv');
+const ctx    = canvas.getContext('2d');
+canvas.width  = W;
+canvas.height = H;
+
+/* ------------------------- 工具函数 ------------------------- */
+const clamp = (v,a,b)=> v < a ? a : (v > b ? b : v);
+const rand  = (a,b)=> a + Math.random()*(b-a);
+const aabb  = (a,b)=> a.x < b.x+b.w && a.x+a.w > b.x && a.y < b.y+b.h && a.y+a.h > b.y;
+
+function roundRect(x,y,w,h,r){
+  ctx.beginPath();
+  ctx.moveTo(x+r,y);
+  ctx.arcTo(x+w,y,x+w,y+h,r);
+  ctx.arcTo(x+w,y+h,x,y+h,r);
+  ctx.arcTo(x,y+h,x,y,r);
+  ctx.arcTo(x,y,x+w,y,r);
+  ctx.closePath();
+}
+
+/* ------------------------- 音效系统 ------------------------- */
+let actx = null;
+function initAudio(){
+  if(actx) return;
+  try{
+    actx = new (window.AudioContext || window.webkitAudioContext)();
+  }catch(e){ actx = null; }
+}
+function sound(freq, dur, type='square', vol=0.055, slideTo=null, delay=0){
+  if(!actx) return;
+  try{
+    const t0 = actx.currentTime + delay;
+    const o = actx.createOscillator();
+    const g = actx.createGain();
+    o.type = type;
+    o.frequency.setValueAtTime(freq, t0);
+    if(slideTo) o.frequency.exponentialRampToValueAtTime(Math.max(slideTo,1), t0+dur);
+    g.gain.setValueAtTime(vol, t0);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0+dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(t0); o.stop(t0+dur+0.02);
+  }catch(e){}
+}
+const SFX = {
+  jump(){ sound(420,0.14,'square',0.05,760); },
+  doubleJump(){ sound(560,0.10,'square',0.05,920); sound(880,0.14,'triangle',0.045,1320,0.05); },
+  coin(){ sound(988,0.07,'square',0.05); sound(1319,0.16,'square',0.05,null,0.07); },
+  stomp(){ sound(180,0.10,'square',0.06,90); },
+  bump(){ sound(150,0.07,'square',0.05,110); },
+  power(){ sound(523,0.09,'square',0.05); sound(659,0.09,'square',0.05,null,0.09);
+           sound(784,0.09,'square',0.05,null,0.18); sound(1047,0.20,'square',0.05,null,0.27); },
+  die(){ sound(440,0.18,'sawtooth',0.07,220); sound(220,0.45,'sawtooth',0.07,70,0.18); },
+  win(){ [523,659,784,1047,1319].forEach((f,i)=> sound(f,0.22,'triangle',0.06,null,i*0.13)); },
+  hurt(){ sound(300,0.3,'sawtooth',0.06,80); }
+};
+
+/* =========================================================================
+   关卡生成
+   ========================================================================= */
+let grid = [];
+let flagX = 0;
+let checkpointXs = [];
+
+function buildLevel(){
+  grid = Array.from({length:ROWS}, ()=> new Array(COLS).fill(' '));
+  const put  = (x,y,c)=>{ if(x>=0&&x<COLS&&y>=0&&y<ROWS) grid[y][x]=c; };
+
+  const holes = [[41,43],[76,78],[113,115],[151,153],[187,189]];
+  for(let x=0; x<COLS; x++){
+    if(holes.some(([a,b])=> x>=a && x<=b)) continue;
+    put(x, GROUND_ROW, '#');
+    put(x, GROUND_ROW+1, '#');
+  }
+
+  [[28,2],[62,3],[97,2],[133,3],[170,2]].forEach(([px,ph])=>{
+    for(let i=0;i<ph;i++){
+      put(px,   GROUND_ROW-1-i, 'p');
+      put(px+1, GROUND_ROW-1-i, 'p');
+    }
+  });
+
+  const patterns = [
+    [12, 10, '?'],
+    [16, 10, 'B?B?B'],
+    [24,  6, 'BBB'],
+    [33, 10, '?BB?'],
+    [48,  6, 'BB?BB'],
+    [66, 10, 'B?B'],
+    [86,  6, 'BBBB?'],
+    [104,10, '?B?'],
+    [124, 6, 'BBB'],
+    [140,10, 'B?BB'],
+    [162, 6, 'B?B?B'],
+    [180,10, 'BB?B'],
+  ];
+  for(const [sx,sy,pat] of patterns){
+    for(let i=0;i<pat.length;i++) put(sx+i, sy, pat[i]);
+  }
+
+  [[30,8],[60,7],[90,9],[120,8],[150,7],[178,8]].forEach(([x,y])=> put(x,y,'K'));
+
+  const coinSpots = [
+    [6,12],[7,12],[8,12],
+    [13,9],[14,9],
+    [25,5],[26,5],[27,5],
+    [34,9],[35,9],[36,9],
+    [44,12],[45,12],[46,12],
+    [49,5],[50,5],[51,5],
+    [56,12],[57,12],[58,12],[59,12],
+    [67,9],[68,9],
+    [80,12],[81,12],[82,12],
+    [87,5],[88,5],[89,5],
+    [94,12],[95,12],[96,12],
+    [105,9],[106,9],
+    [118,12],[119,12],[120,12],
+    [125,5],[126,5],
+    [141,9],[142,9],
+    [147,12],[148,12],[149,12],
+    [156,12],[157,12],[158,12],
+    [163,5],[164,5],[165,5],
+    [173,12],[174,12],[175,12],
+    [181,9],[182,9],
+    [192,12],[193,12],[194,12],
+  ];
+  coinSpots.forEach(([x,y])=>{
+    if(grid[y] && grid[y][x]===' ') grid[y][x] = 'o';
+  });
+
+  flagX = 198 * TILE;
+  checkpointXs = [8, 55, 100, 145, 190].map(x => x*TILE);
+}
+
+/* =========================================================================
+   实体容器
+   ========================================================================= */
+let coins    = [];
+let enemies  = [];
+let particles= [];
+let bumps    = [];
+let floaters = [];
+
+const player = {
+  x: 0, y: 0, w: 24, h: 30,
+  vx: 0, vy: 0,
+  onGround: false,
+  facing: 1,
+  alive: true,
+  invuln: 0,
+  animPhase: 0,
+  bumpedWall: false,
+  jumpsLeft: MAX_JUMPS,   // ← 剩余跳跃次数
+};
+
+let cameraX = 0;
+let spawnX = 0, spawnY = 0;
+let frameCount = 0;
+let deathTimer = 0;
+let timeAcc = 0;
+
+const state = {
+  mode: 'title',
+  score: 0,
+  coinCount: 0,
+  lives: 3,
+  time: 300,
+};
+
+let currentCard = null;
+let cardCooldown = 0;
+
+/* =========================================================================
+   高中知识卡池
+   ========================================================================= */
+const KNOWLEDGE = [
+  { subject:'物理', color:'#2b6bd4', title:'牛顿第二定律',
+    formula:'F = m·a',
+    desc:'物体加速度与合外力成正比、与质量成反比。这是经典力学的核心。' },
+  { subject:'物理', color:'#1e8a5f', title:'平抛运动',
+    formula:'x = v₀t ,  y = ½gt²',
+    desc:'水平方向匀速，竖直方向自由落体，两个分运动互不影响。' },
+  { subject:'物理', color:'#c1440e', title:'动能定理',
+    formula:'W合 = ½mv² − ½mv₀²',
+    desc:'合外力做的功等于物体动能的变化量，比牛顿定律更便于处理变力问题。' },
+  { subject:'物理', color:'#7a3fb5', title:'动量守恒',
+    formula:'m₁v₁ + m₂v₂ = m₁v₁′ + m₂v₂′',
+    desc:'系统不受外力（或合外力为零）时，总动量保持不变。碰撞、爆炸问题的利器。' },
+  { subject:'物理', color:'#0e7fa8', title:'匀速圆周运动',
+    formula:'a = v²/r = ω²r',
+    desc:'向心加速度只改变速度方向，不改变速度大小，方向始终指向圆心。' },
+  { subject:'数学', color:'#2b6bd4', title:'二次函数与抛物线',
+    formula:'y = ax² + bx + c',
+    desc:'顶点坐标 (−b/2a , (4ac−b²)/4a)，a 决定开口方向与开口大小。' },
+  { subject:'数学', color:'#1e8a5f', title:'三角恒等变换',
+    formula:'sin²θ + cos²θ = 1',
+    desc:'同角三角函数基本关系；配合和角公式可推出二倍角、半角公式。' },
+  { subject:'数学', color:'#c1440e', title:'平面向量数量积',
+    formula:'a·b = |a||b|cosθ',
+    desc:'坐标形式 a·b = x₁x₂ + y₁y₂，可用于判断垂直、求夹角与投影。' },
+  { subject:'数学', color:'#7a3fb5', title:'导数与单调性',
+    formula:'(xⁿ)′ = n·xⁿ⁻¹',
+    desc:"f′(x) > 0 时函数单调递增；f′(x) < 0 时单调递减，极值点处 f′(x)=0。" },
+  { subject:'数学', color:'#0e7fa8', title:'等差数列求和',
+    formula:'Sₙ = n(a₁+aₙ)/2',
+    desc:'也可写作 Sₙ = na₁ + n(n−1)d/2，倒序相加法是最经典的推导。' },
+  { subject:'化学', color:'#1e8a5f', title:'物质的量',
+    formula:'n = m/M = N/N_A = V/Vm',
+    desc:'宏观质量与微观粒子数的桥梁，N_A ≈ 6.02×10²³ mol⁻¹。' },
+  { subject:'化学', color:'#c1440e', title:'氧化还原反应',
+    formula:'氧化剂 + ne⁻ → 还原产物',
+    desc:'本质是电子转移，化合价升高失电子被氧化，口诀："升失氧、降得还"。' },
+  { subject:'化学', color:'#7a3fb5', title:'化学平衡常数',
+    formula:'K = [C]ᶜ[D]ᵈ / ([A]ᵃ[B]ᵇ)',
+    desc:'K 只与温度有关；浓度商 Q < K 时反应正向进行。' },
+  { subject:'生物', color:'#2b6bd4', title:'有氧呼吸总反应',
+    formula:'C₆H₁₂O₆ + 6O₂ → 6CO₂ + 6H₂O',
+    desc:'分三个阶段：糖酵解、三羧酸循环、氧化磷酸化，主要产 ATP 在线粒体内膜。' },
+  { subject:'生物', color:'#1e8a5f', title:'基因分离定律',
+    formula:'Aa × Aa → 3 : 1',
+    desc:'等位基因随同源染色体分开而分离，是孟德尔第一定律。' },
+  { subject:'生物', color:'#c1440e', title:'中心法则',
+    formula:'DNA → RNA → 蛋白质',
+    desc:'转录在细胞核，翻译在核糖体；逆转录和 RNA 复制是特例。' },
+];
+
+/* =========================================================================
+   初始化 / 重置
+   ========================================================================= */
+function initEntities(){
+  coins = []; enemies = []; particles = []; bumps = []; floaters = [];
+
+  for(let r=0;r<ROWS;r++){
+    for(let c=0;c<COLS;c++){
+      if(grid[r][c] === 'o'){
+        grid[r][c] = ' ';
+        coins.push({
+          x: c*TILE + 8, y: r*TILE + 8, w: 16, h: 16,
+          phase: Math.random()*Math.PI*2,
+          dead: false
+        });
+      }
+    }
+  }
+
+  const enemySpots = [23,31,38,55,58,72,84,92,101,110,121,129,138,147,160,168,176,185];
+  enemySpots.forEach(col=>{
+    enemies.push({
+      x: col*TILE + 4,
+      y: (GROUND_ROW)*TILE - 24,
+      w: 24, h: 24,
+      vx: 0, vy: 0,
+      dir: Math.random() < 0.5 ? -1 : 1,
+      speed: 1.05,
+      onGround: false,
+      bumpedWall: false,
+      dead: false,
+      squash: 0,
+      phase: Math.random()*Math.PI*2
+    });
+  });
+}
+
+function resetPlayer(){
+  spawnX = 2*TILE;
+  spawnY = GROUND_ROW*TILE - player.h - 2;
+  player.x = spawnX;
+  player.y = spawnY;
+  player.vx = 0;
+  player.vy = 0;
+  player.alive = true;
+  player.invuln = 60;
+  player.onGround = false;
+  player.facing = 1;
+  player.jumpsLeft = MAX_JUMPS;
+  cameraX = 0;
+}
+
+function startGame(){
+  initAudio();
+  buildLevel();
+  initEntities();
+  resetPlayer();
+  state.mode = 'play';
+  state.score = 0;
+  state.coinCount = 0;
+  state.lives = 3;
+  state.time = 300;
+  timeAcc = 0;
+  deathTimer = 0;
+  cardCooldown = 0;
+}
+
+function respawn(){
+  if(state.lives <= 0){
+    state.mode = 'gameover';
+    return;
+  }
+  player.x = spawnX;
+  player.y = spawnY;
+  player.vx = 0;
+  player.vy = 0;
+  player.alive = true;
+  player.invuln = 90;
+  player.onGround = false;
+  player.jumpsLeft = MAX_JUMPS;
+  state.time = Math.max(state.time, 90);
+  cameraX = clamp(player.x - W*0.35, 0, COLS*TILE - W);
+  state.mode = 'play';
+}
+
+/* =========================================================================
+   输入
+   ========================================================================= */
+const keys = { left:false, right:false, jump:false, down:false };
+let jumpQueued = false;
+let jumpBuffer = 0;
+
+const KEYMAP = {
+  ArrowLeft:'left', KeyA:'left',
+  ArrowRight:'right', KeyD:'right',
+  ArrowUp:'jump', KeyW:'jump', Space:'jump',
+  ArrowDown:'down', KeyS:'down',
+};
+
+window.addEventListener('keydown', e=>{
+  initAudio();
+
+  if(state.mode === 'title'){
+    if(e.code === 'Space' || e.code === 'Enter'){ e.preventDefault(); startGame(); }
+    return;
+  }
+  if(state.mode === 'gameover' || state.mode === 'win'){
+    if(e.code === 'Space' || e.code === 'Enter'){ e.preventDefault(); startGame(); }
+    return;
+  }
+  if(state.mode === 'knowledge'){
+    if(cardCooldown <= 0){
+      e.preventDefault();
+      state.mode = 'play';
+      cardCooldown = 20;
+    }
+    return;
+  }
+
+  const k = KEYMAP[e.code];
+  if(k){
+    e.preventDefault();
+    if(k === 'jump' && !keys.jump) jumpQueued = true;
+    keys[k] = true;
+  }
+}, {passive:false});
+
+window.addEventListener('keyup', e=>{
+  const k = KEYMAP[e.code];
+  if(k){ e.preventDefault(); keys[k] = false; }
+}, {passive:false});
+
+document.querySelectorAll('#touch button').forEach(btn=>{
+  const k = btn.dataset.k;
+  const on = e=>{
+    e.preventDefault();
+    initAudio();
+    if(state.mode === 'title' || state.mode === 'gameover' || state.mode === 'win'){ startGame(); return; }
+    if(state.mode === 'knowledge'){ if(cardCooldown<=0){ state.mode='play'; cardCooldown=20; } return; }
+    if(k === 'jump' && !keys.jump) jumpQueued = true;
+    keys[k] = true;
+  };
+  const off = e=>{ e.preventDefault(); keys[k] = false; };
+  btn.addEventListener('touchstart', on, {passive:false});
+  btn.addEventListener('touchend', off, {passive:false});
+  btn.addEventListener('touchcancel', off, {passive:false});
+  btn.addEventListener('mousedown', on);
+  btn.addEventListener('mouseup', off);
+  btn.addEventListener('mouseleave', off);
+});
+
+canvas.addEventListener('mousedown', ()=>{
+  initAudio();
+  if(state.mode === 'title' || state.mode === 'gameover' || state.mode === 'win') startGame();
+  else if(state.mode === 'knowledge' && cardCooldown<=0){ state.mode='play'; cardCooldown=20; }
+});
+
+/* =========================================================================
+   碰撞 & 物理
+   ========================================================================= */
+function isSolid(col,row){
+  if(col < 0 || col >= COLS) return true;
+  if(row < 0 || row >= ROWS) return false;
+  const t = grid[row][col];
+  return t==='#' || t==='B' || t==='?' || t==='U' || t==='p' || t==='K';
+}
+
+function moveX(e){
+  e.x += e.vx;
+  e.bumpedWall = false;
+  const top = Math.floor(e.y / TILE);
+  const bot = Math.floor((e.y + e.h - 1) / TILE);
+
+  if(e.vx > 0){
+    const col = Math.floor((e.x + e.w - 1) / TILE);
+    for(let r=top; r<=bot; r++){
+      if(isSolid(col,r)){
+        e.x = col*TILE - e.w;
+        e.vx = 0; e.bumpedWall = true; return;
+      }
+    }
+  }else if(e.vx < 0){
+    const col = Math.floor(e.x / TILE);
+    for(let r=top; r<=bot; r++){
+      if(isSolid(col,r)){
+        e.x = (col+1)*TILE;
+        e.vx = 0; e.bumpedWall = true; return;
+      }
+    }
+  }
+}
+
+function moveY(e, isPlayer){
+  e.y += e.vy;
+  e.onGround = false;
+  const left  = Math.floor(e.x / TILE);
+  const right = Math.floor((e.x + e.w - 1) / TILE);
+
+  if(e.vy > 0){
+    const row = Math.floor((e.y + e.h - 1) / TILE);
+    for(let c=left; c<=right; c++){
+      if(isSolid(c,row)){
+        e.y = row*TILE - e.h;
+        e.vy = 0; e.onGround = true; return;
+      }
+    }
+  }else if(e.vy < 0){
+    const row = Math.floor(e.y / TILE);
+    for(let c=left; c<=right; c++){
+      if(isSolid(c,row)){
+        e.y = (row+1)*TILE;
+        e.vy = 0;
+        if(isPlayer) hitBlock(c,row);
+        return;
+      }
+    }
+  }
+}
+
+function hitBlock(col,row){
+  if(row < 0 || row >= ROWS || col < 0 || col >= COLS) return;
+  const t = grid[row][col];
+  const px = col*TILE + TILE/2;
+  const py = row*TILE;
+
+  if(t === '?'){
+    grid[row][col] = 'U';
+    bumps.push({col,row,t:0});
+    state.score += 200;
+    state.coinCount++;
+    particles.push({x:px, y:py-10, vx:0, vy:-5, life:34, maxLife:34, color:'#ffd93b', size:9, kind:'coin'});
+    floaters.push({x:px, y:py-24, text:'+200', life:50, color:'#ffe66d'});
+    SFX.coin();
+  }else if(t === 'K'){
+    grid[row][col] = 'U';
+    bumps.push({col,row,t:0});
+    state.score += 500;
+    floaters.push({x:px, y:py-24, text:'+500', life:60, color:'#9be7ff'});
+    showKnowledge();
+  }else if(t === 'B'){
+    bumps.push({col,row,t:0});
+    SFX.bump();
+  }
+}
+
+function showKnowledge(){
+  const card = KNOWLEDGE[Math.floor(Math.random()*KNOWLEDGE.length)];
+  currentCard = card;
+  state.mode = 'knowledge';
+  cardCooldown = 15;
+  SFX.power();
+}
+
+/* =========================================================================
+   更新 —— 玩家（核心改动：二段跳 + 阻尼移动）
+   ========================================================================= */
+function updatePlayer(){
+  const p = player;
+
+  /* ==================== 水平移动：带阻尼感 ==================== */
+  let dir = 0;
+  if(keys.left)  dir -= 1;
+  if(keys.right) dir += 1;
+
+  if(dir !== 0){
+    // 空中操控力减弱
+    const control = p.onGround ? 1 : AIR_CONTROL;
+    // 反向输入时刹车更迅速
+    const braking = (dir * p.vx < 0) ? 1.6 : 1;
+    // 接近最高速度时加速度自然衰减（阻尼曲线）
+    const speedFactor = Math.max(0.32, 1 - Math.abs(p.vx) / (MAX_RUN * 1.8));
+
+    p.vx += dir * ACCEL * control * braking * speedFactor;
+    p.vx = clamp(p.vx, -MAX_RUN, MAX_RUN);
+    p.facing = dir;
+  }else{
+    // 松开按键：平滑减速（阻尼感的核心）
+    if(p.onGround){
+      const decel = 0.16 + Math.abs(p.vx) * 0.05;
+      if(Math.abs(p.vx) <= decel) p.vx = 0;
+      else p.vx -= Math.sign(p.vx) * decel;
+    }else{
+      p.vx *= AIR_DRAG;
+      if(Math.abs(p.vx) < 0.05) p.vx = 0;
+    }
+  }
+
+  /* ==================== 跳跃缓冲 ==================== */
+  if(jumpQueued){ jumpBuffer = 8; jumpQueued = false; }
+  if(jumpBuffer > 0) jumpBuffer--;
+
+  /* ==================== 落地重置跳跃次数 ==================== */
+  if(p.onGround) p.jumpsLeft = MAX_JUMPS;
+
+  /* ==================== 跳跃 / 二段跳 ==================== */
+  if(jumpBuffer > 0 && p.jumpsLeft > 0){
+    const isDouble = !p.onGround && p.jumpsLeft < MAX_JUMPS;
+
+    p.vy = isDouble ? JUMP_V_DOUBLE : JUMP_V;
+    p.onGround = false;
+    p.jumpsLeft--;
+    jumpBuffer = 0;
+
+    if(isDouble){
+      /* 二段跳特效：脚下气环 + 音效 + 飘字 */
+      SFX.doubleJump();
+      for(let i=0;i<12;i++){
+        const a = (i/12) * Math.PI * 2;
+        particles.push({
+          x: p.x + p.w/2 + Math.cos(a) * 9,
+          y: p.y + p.h - 2 + Math.sin(a) * 4,
+          vx: Math.cos(a) * rand(1.6, 3.2),
+          vy: Math.sin(a) * rand(1.2, 2.4) + 0.8,
+          life: 26, maxLife: 26,
+          color: '#9be7ff', size: rand(2, 4), kind: 'dot'
+        });
+      }
+      floaters.push({
+        x: p.x + p.w/2, y: p.y - 6,
+        text: '二段跳!', life: 40, color: '#9be7ff'
+      });
+    }else{
+      SFX.jump();
+    }
+  }
+
+  /* ==================== 重力（可变跳跃高度） ==================== */
+  let g = GRAVITY;
+  if(p.vy < 0 && !keys.jump) g *= 1.95;
+  p.vy = Math.min(p.vy + g, MAX_FALL);
+
+  /* ==================== 移动与碰撞 ==================== */
+  moveX(p);
+  moveY(p, true);
+
+  if(p.x < 0){ p.x = 0; p.vx = 0; }
+
+  /* ==================== 动画相位 ==================== */
+  if(p.onGround && Math.abs(p.vx) > 0.3) p.animPhase += Math.abs(p.vx) * 0.12;
+  else if(!p.onGround) p.animPhase += 0.06;
+
+  /* ==================== 无敌时间 ==================== */
+  if(p.invuln > 0) p.invuln--;
+
+  /* ==================== 掉出地图 ==================== */
+  if(p.y > H + 80){ killPlayer(true); }
+
+  /* ==================== 检查点 ==================== */
+  for(const cx of checkpointXs){
+    if(p.x > cx && spawnX < cx){ spawnX = cx; spawnY = GROUND_ROW*TILE - p.h - 2; }
+  }
+
+  /* ==================== 到达终点 ==================== */
+  if(p.x + p.w > flagX){
+    state.mode = 'win';
+    state.score += Math.floor(state.time) * 10;
+    SFX.win();
+  }
+}
+
+function updateEnemies(){
+  for(const e of enemies){
+    if(e.dead) continue;
+
+    if(e.x - cameraX < -160 || e.x - cameraX > W + 160){
+      continue;
+    }
+
+    e.vx = e.dir * e.speed;
+    e.vy = Math.min(e.vy + GRAVITY, MAX_FALL);
+
+    moveX(e);
+    if(e.bumpedWall){ e.dir *= -1; }
+
+    moveY(e, false);
+
+    if(e.onGround){
+      const aheadCol = e.dir > 0 ? Math.floor((e.x + e.w + 3)/TILE) : Math.floor((e.x - 3)/TILE);
+      const belowRow = Math.floor((e.y + e.h + 4)/TILE);
+      if(!isSolid(aheadCol, belowRow)) e.dir *= -1;
+    }
+
+    if(e.y > H + 120){ e.dead = true; continue; }
+
+    e.phase += 0.18;
+
+    if(player.alive && player.invuln <= 0 && aabb(player, e)){
+      const stomping = player.vy > 0 && (player.y + player.h) < (e.y + e.h * 0.7);
+      if(stomping){
+        e.dead = true;
+        e.squash = 1;
+        player.vy = -9.5;
+        state.score += 200;
+        floaters.push({x:e.x+12, y:e.y-10, text:'+200', life:45, color:'#ffb3b3'});
+        for(let i=0;i<8;i++){
+          particles.push({
+            x:e.x+12, y:e.y+12,
+            vx:rand(-3,3), vy:rand(-4,-1),
+            life:30, maxLife:30, color:'#8b5a2b', size:rand(2,5), kind:'dot'
+          });
+        }
+        SFX.stomp();
+      }else{
+        killPlayer(false);
+      }
+    }
+  }
+}
+
+function updateCoins(){
+  for(const c of coins){
+    if(c.dead) continue;
+    c.phase += 0.12;
+    if(aabb(player, c)){
+      c.dead = true;
+      state.coinCount++;
+      state.score += 100;
+      floaters.push({x:c.x+8, y:c.y-6, text:'+100', life:40, color:'#ffe66d'});
+      for(let i=0;i<6;i++){
+        particles.push({
+          x:c.x+8, y:c.y+8,
+          vx:rand(-2.5,2.5), vy:rand(-3.5,-0.5),
+          life:26, maxLife:26, color:'#ffd93b', size:rand(2,4), kind:'dot'
+        });
+      }
+      SFX.coin();
+    }
+  }
+}
+
+function updateParticles(){
+  for(let i=particles.length-1; i>=0; i--){
+    const p = particles[i];
+    p.x += p.vx;
+    p.y += p.vy;
+    p.vy += 0.28;
+    p.life--;
+    if(p.life <= 0) particles.splice(i,1);
+  }
+  for(let i=floaters.length-1; i>=0; i--){
+    const f = floaters[i];
+    f.y -= 0.7;
+    f.life--;
+    if(f.life <= 0) floaters.splice(i,1);
+  }
+  for(let i=bumps.length-1; i>=0; i--){
+    bumps[i].t++;
+    if(bumps[i].t > 12) bumps.splice(i,1);
+  }
+}
+
+function updateCamera(){
+  const target = player.x + player.w/2 - W*0.38;
+  cameraX += (target - cameraX) * 0.14;
+  cameraX = clamp(cameraX, 0, COLS*TILE - W);
+}
+
+function killPlayer(fell){
+  if(state.mode !== 'play') return;
+  state.lives--;
+  state.mode = 'dead';
+  deathTimer = 0;
+  player.alive = false;
+  player.vy = fell ? 4 : -12;
+  player.vx = 0;
+  SFX.die();
+}
+
+function update(){
+  frameCount++;
+  if(cardCooldown > 0) cardCooldown--;
+
+  if(state.mode === 'title' || state.mode === 'gameover' || state.mode === 'win' || state.mode === 'knowledge'){
+    return;
+  }
+
+  if(state.mode === 'dead'){
+    player.vy += GRAVITY;
+    player.y += player.vy;
+    deathTimer++;
+    updateParticles();
+    if(deathTimer > 80){
+      if(state.lives <= 0){
+        state.mode = 'gameover';
+      }else{
+        respawn();
+      }
+    }
+    return;
+  }
+
+  timeAcc++;
+  if(timeAcc >= 60){
+    timeAcc = 0;
+    state.time--;
+    if(state.time <= 0){
+      state.time = 0;
+      killPlayer(false);
+      return;
+    }
+  }
+
+  updatePlayer();
+  updateEnemies();
+  updateCoins();
+  updateParticles();
+  updateCamera();
+}
+
+/* =========================================================================
+   渲染 —— 背景
+   ========================================================================= */
+const clouds = [];
+for(let i=0;i<26;i++){
+  clouds.push({ x: rand(0, 2800), y: rand(30, 190), s: rand(0.7, 1.5) });
+}
+const hills = [];
+for(let i=0;i<40;i++){
+  hills.push({ x: rand(0, 4200), r: rand(60, 130), shade: i%2 });
+}
+const bushes = [];
+for(let i=0;i<60;i++){
+  bushes.push({ x: rand(0, 7000), s: rand(0.7, 1.3) });
+}
+
+function drawBackground(){
+  const sky = ctx.createLinearGradient(0,0,0,H);
+  sky.addColorStop(0,   '#3f7fe8');
+  sky.addColorStop(0.55,'#8dc2ff');
+  sky.addColorStop(1,   '#d8ecff');
+  ctx.fillStyle = sky;
+  ctx.fillRect(0,0,W,H);
+
+  for(const h of hills){
+    const x = h.x - cameraX*0.22;
+    if(x < -260 || x > W+260) continue;
+    ctx.fillStyle = h.shade ? '#5aa85a' : '#4a9750';
+    ctx.beginPath();
+    ctx.arc(x, GROUND_ROW*TILE + 40, h.r, Math.PI, 0);
+    ctx.fill();
+  }
+
+  for(const c of clouds){
+    const x = c.x - cameraX*0.35;
+    if(x < -220 || x > W+220) continue;
+    drawCloud(x, c.y, c.s);
+  }
+
+  for(const b of bushes){
+    const x = b.x - cameraX*0.72;
+    if(x < -160 || x > W+160) continue;
+    const baseY = GROUND_ROW*TILE + 2;
+    ctx.fillStyle = '#3d8b45';
+    for(let i=0;i<3;i++){
+      ctx.beginPath();
+      ctx.arc(x + i*24*b.s, baseY - 12*b.s, 20*b.s, Math.PI, 0);
+      ctx.fill();
+    }
+    ctx.fillRect(x - 20*b.s, baseY - 14*b.s, 68*b.s, 14*b.s);
+  }
+}
+
+function drawCloud(x,y,s){
+  ctx.save();
+  ctx.fillStyle = 'rgba(255,255,255,0.92)';
+  ctx.beginPath();
+  ctx.arc(x,          y,          20*s, 0, Math.PI*2);
+  ctx.arc(x + 22*s,   y - 12*s,   26*s, 0, Math.PI*2);
+  ctx.arc(x + 52*s,   y,          20*s, 0, Math.PI*2);
+  ctx.arc(x + 26*s,   y + 10*s,   20*s, 0, Math.PI*2);
+  ctx.fill();
+  ctx.restore();
+}
+
+/* =========================================================================
+   渲染 —— 瓦片
+   ========================================================================= */
+function getBumpOffset(col,row){
+  for(const b of bumps){
+    if(b.col === col && b.row === row){
+      return -Math.sin(b.t/12*Math.PI) * 9;
+    }
+  }
+  return 0;
+}
+
+function drawTiles(){
+  const c0 = Math.max(0, Math.floor(cameraX / TILE) - 1);
+  const c1 = Math.min(COLS-1, Math.floor((cameraX + W) / TILE) + 1);
+
+  for(let r=0; r<ROWS; r++){
+    for(let c=c0; c<=c1; c++){
+      const t = grid[r][c];
+      if(t === ' ') continue;
+      const x = c*TILE - cameraX;
+      const y = r*TILE + getBumpOffset(c,r);
+      drawTile(t, x, y, c, r);
+    }
+  }
+}
+
+function drawTile(t,x,y,col,row){
+  switch(t){
+    case '#': {
+      const top = (row === 0 || grid[row-1][col] !== '#');
+      ctx.fillStyle = '#b8621f';
+      ctx.fillRect(x, y, TILE, TILE);
+      if(top){
+        ctx.fillStyle = '#e2913f';
+        ctx.fillRect(x, y, TILE, 7);
+        ctx.fillStyle = '#f2b667';
+        ctx.fillRect(x, y, TILE, 3);
+      }
+      ctx.strokeStyle = 'rgba(80,30,0,.32)';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(x+0.5, y+0.5, TILE-1, TILE-1);
+      ctx.fillStyle = 'rgba(0,0,0,.10)';
+      ctx.fillRect(x+6, y+14, 6, 6);
+      ctx.fillRect(x+20, y+22, 5, 5);
+      break;
+    }
+    case 'B': {
+      ctx.fillStyle = '#a8521b';
+      ctx.fillRect(x, y, TILE, TILE);
+      ctx.strokeStyle = 'rgba(60,20,0,.55)';
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(x, y+10.5); ctx.lineTo(x+TILE, y+10.5);
+      ctx.moveTo(x, y+21.5); ctx.lineTo(x+TILE, y+21.5);
+      ctx.moveTo(x+16.5, y); ctx.lineTo(x+16.5, y+10);
+      ctx.moveTo(x+8.5, y+11); ctx.lineTo(x+8.5, y+21);
+      ctx.moveTo(x+24.5, y+11); ctx.lineTo(x+24.5, y+21);
+      ctx.moveTo(x+16.5, y+22); ctx.lineTo(x+16.5, y+TILE);
+      ctx.stroke();
+      ctx.fillStyle = 'rgba(255,255,255,.12)';
+      ctx.fillRect(x, y, TILE, 3);
+      break;
+    }
+    case '?': {
+      const pulse = 0.5 + 0.5*Math.sin(frameCount*0.09 + col);
+      ctx.fillStyle = '#d99411';
+      roundRect(x+1, y+1, TILE-2, TILE-2, 5); ctx.fill();
+      ctx.fillStyle = `rgb(${240},${185 + pulse*40},${40})`;
+      roundRect(x+3, y+3, TILE-6, TILE-6, 4); ctx.fill();
+      ctx.fillStyle = '#7a4a00';
+      ctx.font = 'bold 20px "Segoe UI",sans-serif';
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText('?', x+TILE/2, y+TILE/2+1);
+      ctx.fillStyle = '#8a5a10';
+      [[6,6],[TILE-7,6],[6,TILE-7],[TILE-7,TILE-7]].forEach(([dx,dy])=>{
+        ctx.fillRect(x+dx, y+dy, 2.5, 2.5);
+      });
+      break;
+    }
+    case 'U': {
+      ctx.fillStyle = '#7a5a34';
+      roundRect(x+1, y+1, TILE-2, TILE-2, 5); ctx.fill();
+      ctx.fillStyle = '#9a7a4e';
+      roundRect(x+3, y+3, TILE-6, TILE-6, 4); ctx.fill();
+      ctx.fillStyle = 'rgba(0,0,0,.18)';
+      ctx.fillRect(x+8, y+8, TILE-16, TILE-16);
+      break;
+    }
+    case 'K': {
+      const pulse = 0.5 + 0.5*Math.sin(frameCount*0.07 + col*0.6);
+      ctx.fillStyle = '#3b2f8f';
+      roundRect(x+1, y+1, TILE-2, TILE-2, 5); ctx.fill();
+      ctx.fillStyle = `rgba(110,180,255,${0.55 + pulse*0.35})`;
+      roundRect(x+3, y+3, TILE-6, TILE-6, 4); ctx.fill();
+      ctx.fillStyle = '#ffffff';
+      ctx.font = 'bold 17px "Segoe UI",sans-serif';
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText('知', x+TILE/2, y+TILE/2+1);
+      ctx.strokeStyle = `rgba(150,220,255,${0.35 + pulse*0.5})`;
+      ctx.lineWidth = 2;
+      roundRect(x+1, y+1, TILE-2, TILE-2, 5); ctx.stroke();
+      break;
+    }
+    case 'p': {
+      const isTop = !(row > 0 && grid[row-1][col] === 'p');
+      const isLeft = !(col > 0 && grid[row][col-1] === 'p');
+      ctx.fillStyle = '#2a9d3f';
+      ctx.fillRect(x, y, TILE, TILE);
+      ctx.fillStyle = '#43c25c';
+      ctx.fillRect(x + (isLeft ? 3 : 0), y, TILE*0.35, TILE);
+      ctx.fillStyle = '#1c7a2c';
+      ctx.fillRect(x + TILE - 6, y, 6, TILE);
+      if(isTop){
+        ctx.fillStyle = '#2a9d3f';
+        ctx.fillRect(x - (isLeft?4:0), y, TILE + 4, 12);
+        ctx.fillStyle = '#43c25c';
+        ctx.fillRect(x - (isLeft?4:0), y, TILE + 4, 4);
+        ctx.fillStyle = '#1c7a2c';
+        ctx.fillRect(x - (isLeft?4:0), y+11, TILE + 4, 2);
+      }
+      ctx.strokeStyle = 'rgba(0,0,0,.25)';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(x+0.5, y+0.5, TILE-1, TILE-1);
+      break;
+    }
+  }
+}
+
+/* =========================================================================
+   渲染 —— 旗帜 / 城堡
+   ========================================================================= */
+function drawFlag(){
+  const x = flagX - cameraX;
+  if(x < -400 || x > W + 400) return;
+
+  const baseY = GROUND_ROW*TILE;
+
+  const cx = x + 150;
+  ctx.fillStyle = '#9a9a9a';
+  ctx.fillRect(cx, baseY-150, 150, 150);
+  ctx.fillStyle = '#b5b5b5';
+  ctx.fillRect(cx, baseY-150, 150, 12);
+  for(let i=0;i<5;i++){
+    ctx.fillStyle = '#9a9a9a';
+    ctx.fillRect(cx + i*30, baseY-166, 20, 18);
+  }
+  ctx.fillStyle = '#4a3320';
+  ctx.beginPath();
+  ctx.arc(cx+75, baseY-45, 24, Math.PI, 0);
+  ctx.fill();
+  ctx.fillRect(cx+51, baseY-45, 48, 45);
+  ctx.fillStyle = '#6b6b6b';
+  ctx.fillRect(cx+20, baseY-115, 22, 26);
+  ctx.fillRect(cx+108, baseY-115, 22, 26);
+
+  ctx.fillStyle = '#c3d0dd';
+  ctx.fillRect(x, baseY-330, 6, 330);
+  ctx.fillStyle = 'rgba(255,255,255,.5)';
+  ctx.fillRect(x, baseY-330, 2, 330);
+
+  ctx.fillStyle = '#ffd93b';
+  ctx.beginPath();
+  ctx.arc(x+3, baseY-334, 8, 0, Math.PI*2);
+  ctx.fill();
+
+  const wave = Math.sin(frameCount*0.1) * 7;
+  ctx.fillStyle = '#e63946';
+  ctx.beginPath();
+  ctx.moveTo(x+6, baseY-310);
+  ctx.quadraticCurveTo(x+45, baseY-300+wave, x+80, baseY-285+wave*0.6);
+  ctx.lineTo(x+80, baseY-235+wave*0.6);
+  ctx.quadraticCurveTo(x+45, baseY-250+wave, x+6, baseY-240);
+  ctx.closePath();
+  ctx.fill();
+
+  ctx.fillStyle = '#fff';
+  ctx.beginPath();
+  ctx.arc(x+38, baseY-275+wave*0.8, 11, 0, Math.PI*2);
+  ctx.fill();
+  ctx.fillStyle = '#e63946';
+  ctx.font = 'bold 15px "Segoe UI",sans-serif';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText('终', x+38, baseY-274+wave*0.8);
+}
+
+/* =========================================================================
+   渲染 —— 金币
+   ========================================================================= */
+function drawCoins(){
+  for(const c of coins){
+    if(c.dead) continue;
+    const x = c.x - cameraX;
+    if(x < -40 || x > W + 40) continue;
+
+    const sw = Math.abs(Math.cos(c.phase));
+    const scaleX = 0.25 + sw * 0.75;
+    const bob = Math.sin(c.phase*2) * 2;
+
+    ctx.save();
+    ctx.translate(x + 8, c.y + 8 + bob);
+    ctx.scale(scaleX, 1);
+
+    const g = ctx.createLinearGradient(0,-9,0,9);
+    g.addColorStop(0, '#fff3a8');
+    g.addColorStop(0.5,'#ffd93b');
+    g.addColorStop(1, '#e0a300');
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.ellipse(0,0,9,10,0,0,Math.PI*2);
+    ctx.fill();
+
+    ctx.strokeStyle = '#b8860b';
+    ctx.lineWidth = 1.4;
+    ctx.stroke();
+
+    ctx.fillStyle = 'rgba(255,255,255,.85)';
+    ctx.fillRect(-3, -5, 2, 10);
+    ctx.restore();
+  }
+}
+
+/* =========================================================================
+   渲染 —— 敌人
+   ========================================================================= */
+function drawEnemies(){
+  for(const e of enemies){
+    if(e.dead) continue;
+    const x = e.x - cameraX;
+    if(x < -60 || x > W + 60) continue;
+
+    if(e.squash > 0){
+      ctx.fillStyle = '#8b5a2b';
+      ctx.beginPath();
+      ctx.ellipse(x+12, e.y+22, 14, 5, 0, 0, Math.PI*2);
+      ctx.fill();
+      continue;
+    }
+
+    const wobble = Math.sin(e.phase) * 1.6;
+
+    const g = ctx.createLinearGradient(0, e.y, 0, e.y+24);
+    g.addColorStop(0, '#a9703a');
+    g.addColorStop(1, '#7a4a20');
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.ellipse(x+12, e.y+11, 13, 11, 0, Math.PI, 0);
+    ctx.fill();
+    ctx.fillRect(x-1, e.y+10, 26, 8);
+
+    ctx.fillStyle = 'rgba(255,255,255,.22)';
+    ctx.beginPath();
+    ctx.ellipse(x+8, e.y+7, 4, 3, -0.5, 0, Math.PI*2);
+    ctx.fill();
+
+    ctx.fillStyle = '#fff';
+    ctx.beginPath();
+    ctx.ellipse(x+8,  e.y+13, 3.4, 3.8, 0, 0, Math.PI*2);
+    ctx.ellipse(x+16, e.y+13, 3.4, 3.8, 0, 0, Math.PI*2);
+    ctx.fill();
+
+    const look = e.dir > 0 ? 1.1 : -1.1;
+    ctx.fillStyle = '#1a1a1a';
+    ctx.beginPath();
+    ctx.arc(x+8+look,  e.y+13.5, 1.7, 0, Math.PI*2);
+    ctx.arc(x+16+look, e.y+13.5, 1.7, 0, Math.PI*2);
+    ctx.fill();
+
+    ctx.fillStyle = '#3a2412';
+    ctx.beginPath();
+    ctx.ellipse(x+5+wobble,  e.y+22, 7, 3.5, 0, 0, Math.PI*2);
+    ctx.ellipse(x+19-wobble, e.y+22, 7, 3.5, 0, 0, Math.PI*2);
+    ctx.fill();
+  }
+}
+
+/* =========================================================================
+   渲染 —— 玩家
+   ========================================================================= */
+function drawMario(){
+  const p = player;
+  if(!p.alive && state.mode !== 'dead') return;
+  if(p.invuln > 0 && Math.floor(frameCount/4) % 2 === 0 && state.mode === 'play') return;
+
+  const x = p.x - cameraX;
+  const y = p.y;
+  const w = p.w, h = p.h;
+
+  const walking = p.onGround && Math.abs(p.vx) > 0.3;
+  const legSwing = walking ? Math.sin(p.animPhase) * 3 : 0;
+  const armSwing = walking ? Math.sin(p.animPhase + Math.PI) * 2 : 0;
+
+  ctx.save();
+
+  /* 影子 */
+  ctx.fillStyle = 'rgba(0,0,0,.18)';
+  ctx.beginPath();
+  ctx.ellipse(x+w/2, y+h+1, w*0.42, 3.5, 0, 0, Math.PI*2);
+  ctx.fill();
+
+  /* 二段跳可用时的脚下光环 */
+  if(!p.onGround && p.jumpsLeft > 0 && state.mode === 'play'){
+    const a = 0.25 + 0.15*Math.sin(frameCount*0.2);
+    ctx.strokeStyle = `rgba(155,231,255,${a})`;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.ellipse(x+w/2, y+h+3, w*0.55, 4, 0, 0, Math.PI*2);
+    ctx.stroke();
+  }
+
+  ctx.fillStyle = '#4a2c0f';
+  ctx.fillRect(x+1,        y+h-5, 9, 5);
+  ctx.fillRect(x+w-10,     y+h-5, 9, 5);
+  ctx.fillStyle = '#5e3a16';
+  ctx.fillRect(x+1+legSwing, y+h-5, 9, 3);
+  ctx.fillRect(x+w-10-legSwing, y+h-5, 9, 3);
+
+  ctx.fillStyle = '#2b6bd4';
+  ctx.fillRect(x+2, y+h-17, w-4, 13);
+  ctx.fillStyle = '#1e56ad';
+  ctx.fillRect(x+2, y+h-17, w-4, 3);
+
+  ctx.fillStyle = '#e63946';
+  ctx.fillRect(x+2, y+9, w-4, 7);
+
+  ctx.fillStyle = '#e63946';
+  ctx.fillRect(x-1, y+11+armSwing, 3, 8);
+  ctx.fillRect(x+w-2, y+11-armSwing, 3, 8);
+  ctx.fillStyle = '#f7c9a0';
+  ctx.fillRect(x-1, y+18+armSwing, 3, 3);
+  ctx.fillRect(x+w-2, y+18-armSwing, 3, 3);
+
+  ctx.fillStyle = '#2b6bd4';
+  ctx.fillRect(x+6, y+10, 3, 6);
+  ctx.fillRect(x+w-9, y+10, 3, 6);
+
+  ctx.fillStyle = '#f7c9a0';
+  ctx.fillRect(x+3, y+3, w-6, 8);
+
+  ctx.fillStyle = '#22303f';
+  const eyeX = p.facing > 0 ? x + w - 9 : x + 6;
+  ctx.fillRect(eyeX, y+5, 2.5, 3.5);
+
+  ctx.fillStyle = '#5a3410';
+  ctx.fillRect(p.facing > 0 ? x+w-12 : x+5, y+9, 7, 2);
+
+  ctx.fillStyle = '#e63946';
+  ctx.fillRect(x+2, y, w-4, 4);
+  ctx.fillRect(x + (p.facing > 0 ? 1 : -4), y+3, w+3, 2.5);
+  ctx.fillStyle = '#c22a35';
+  ctx.fillRect(x + (p.facing > 0 ? 1 : -4), y+5, w+3, 1);
+  ctx.fillStyle = '#fff';
+  ctx.beginPath();
+  ctx.arc(x + (p.facing > 0 ? w-8 : 8), y+2, 2.2, 0, Math.PI*2);
+  ctx.fill();
+
+  ctx.restore();
+}
+
+/* =========================================================================
+   渲染 —— 粒子 / 浮动文字
+   ========================================================================= */
+function drawParticles(){
+  for(const p of particles){
+    const a = p.life / p.maxLife;
+    ctx.globalAlpha = a;
+    ctx.fillStyle = p.color;
+    if(p.kind === 'coin'){
+      ctx.beginPath();
+      ctx.ellipse(p.x - cameraX, p.y, p.size*0.6, p.size, 0, 0, Math.PI*2);
+      ctx.fill();
+    }else{
+      ctx.beginPath();
+      ctx.arc(p.x - cameraX, p.y, p.size, 0, Math.PI*2);
+      ctx.fill();
+    }
+  }
+  ctx.globalAlpha = 1;
+
+  ctx.textAlign = 'center';
+  ctx.font = 'bold 15px "Segoe UI",sans-serif';
+  for(const f of floaters){
+    const a = Math.min(1, f.life / 25);
+    ctx.globalAlpha = a;
+    ctx.fillStyle = 'rgba(0,0,0,.5)';
+    ctx.fillText(f.text, f.x - cameraX + 1, f.y + 1);
+    ctx.fillStyle = f.color;
+    ctx.fillText(f.text, f.x - cameraX, f.y);
+  }
+  ctx.globalAlpha = 1;
+}
+
+/* =========================================================================
+   渲染 —— HUD
+   ========================================================================= */
+function drawHUD(){
+  ctx.save();
+
+  ctx.fillStyle = 'rgba(8,16,34,.55)';
+  roundRect(14, 12, 348, 44, 12); ctx.fill();
+  roundRect(W-190, 12, 176, 44, 12); ctx.fill();
+
+  ctx.textBaseline = 'middle';
+
+  ctx.textAlign = 'left';
+  ctx.font = 'bold 13px "Segoe UI",sans-serif';
+  ctx.fillStyle = 'rgba(180,215,255,.75)';
+  ctx.fillText('分数', 30, 26);
+  ctx.font = 'bold 20px "Segoe UI",sans-serif';
+  ctx.fillStyle = '#ffffff';
+  ctx.fillText(String(state.score).padStart(6,'0'), 30, 45);
+
+  ctx.font = 'bold 13px "Segoe UI",sans-serif';
+  ctx.fillStyle = 'rgba(180,215,255,.75)';
+  ctx.fillText('金币', 148, 26);
+  ctx.font = 'bold 20px "Segoe UI",sans-serif';
+  ctx.fillStyle = '#ffd93b';
+  ctx.beginPath();
+  ctx.ellipse(158, 45, 7, 8.5, 0, 0, Math.PI*2);
+  ctx.fill();
+  ctx.fillStyle = '#ffffff';
+  ctx.fillText('×' + state.coinCount, 172, 45);
+
+  ctx.font = 'bold 13px "Segoe UI",sans-serif';
+  ctx.fillStyle = 'rgba(180,215,255,.75)';
+  ctx.fillText('生命', 258, 26);
+  for(let i=0;i<Math.max(0, Math.min(5, state.lives)); i++){
+    drawHeart(272 + i*22, 45, 8);
+  }
+  if(state.lives > 5){
+    ctx.font = 'bold 16px "Segoe UI",sans-serif';
+    ctx.fillStyle = '#ff6b6b';
+    ctx.fillText('×' + state.lives, 272 + 5*22, 45);
+  }
+
+  ctx.textAlign = 'center';
+  ctx.font = 'bold 13px "Segoe UI",sans-serif';
+  ctx.fillStyle = 'rgba(180,215,255,.75)';
+  ctx.fillText('剩余时间', W-102, 26);
+  ctx.font = 'bold 22px "Segoe UI",sans-serif';
+  ctx.fillStyle = state.time < 60 ? '#ff6b6b' : '#ffffff';
+  ctx.fillText(String(Math.max(0, state.time)).padStart(3,'0'), W-102, 45);
+
+  /* 右上角跳跃指示器（二段跳状态） */
+  ctx.textAlign = 'left';
+  ctx.font = 'bold 12px "Segoe UI",sans-serif';
+  ctx.fillStyle = 'rgba(180,215,255,.7)';
+  const jx = W - 190 + 12;
+  const jy = 44;
+  for(let i=0;i<MAX_JUMPS;i++){
+    const available = i < player.jumpsLeft;
+    ctx.beginPath();
+    ctx.arc(jx + i*14, jy, 5, 0, Math.PI*2);
+    ctx.fillStyle = available ? '#9be7ff' : 'rgba(120,150,200,.25)';
+    ctx.fill();
+    if(available){
+      ctx.strokeStyle = 'rgba(200,240,255,.9)';
+      ctx.lineWidth = 1;
+      ctx.stroke();
+    }
+  }
+
+  /* 进度条 */
+  const prog = clamp((player.x) / flagX, 0, 1);
+  ctx.fillStyle = 'rgba(0,0,0,.28)';
+  roundRect(14, 64, W-28, 6, 3); ctx.fill();
+  const pg = ctx.createLinearGradient(14,0,W-14,0);
+  pg.addColorStop(0, '#4ade80');
+  pg.addColorStop(0.6,'#ffd93b');
+  pg.addColorStop(1, '#ff6b6b');
+  ctx.fillStyle = pg;
+  roundRect(14, 64, (W-28)*prog, 6, 3); ctx.fill();
+
+  ctx.restore();
+}
+
+function drawHeart(cx, cy, r){
+  ctx.save();
+  ctx.fillStyle = '#ff4d5e';
+  ctx.beginPath();
+  ctx.moveTo(cx, cy + r*0.75);
+  ctx.bezierCurveTo(cx - r*1.4, cy - r*0.35, cx - r*0.5, cy - r*1.25, cx, cy - r*0.35);
+  ctx.bezierCurveTo(cx + r*0.5, cy - r*1.25, cx + r*1.4, cy - r*0.35, cx, cy + r*0.75);
+  ctx.closePath();
+  ctx.fill();
+  ctx.fillStyle = 'rgba(255,255,255,.45)';
+  ctx.beginPath();
+  ctx.arc(cx - r*0.45, cy - r*0.5, r*0.22, 0, Math.PI*2);
+  ctx.fill();
+  ctx.restore();
+}
+
+/* =========================================================================
+   渲染 —— 覆盖层
+   ========================================================================= */
+function drawOverlays(){
+  if(state.mode === 'title'){
+    ctx.fillStyle = 'rgba(6,12,28,.72)';
+    ctx.fillRect(0,0,W,H);
+
+    const glow = 0.5 + 0.5*Math.sin(frameCount*0.05);
+    ctx.save();
+    ctx.shadowColor = `rgba(255,210,80,${0.4 + glow*0.4})`;
+    ctx.shadowBlur = 30 + glow*20;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.font = 'bold 62px "Segoe UI","PingFang SC",sans-serif';
+    ctx.fillStyle = '#ffd93b';
+    ctx.fillText('超级马里奥', W/2, 145);
+    ctx.restore();
+
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.font = 'bold 26px "Segoe UI","PingFang SC",sans-serif';
+    ctx.fillStyle = '#8ecbff';
+    ctx.fillText('· 高中知识大冒险 ·', W/2, 198);
+
+    ctx.font = '16px "Segoe UI","PingFang SC",sans-serif';
+    ctx.fillStyle = 'rgba(220,235,255,.85)';
+    ctx.fillText('顶开「知」方块，解锁高中九大学科核心公式', W/2, 246);
+
+    ctx.font = 'bold 15px "Segoe UI","PingFang SC",sans-serif';
+    ctx.fillStyle = 'rgba(255,255,255,.95)';
+    ctx.fillText('← →  /  A D    移动（带阻尼惯性）', W/2, 300);
+    ctx.fillText('空格 / ↑ / W    跳跃 · 空中再按一次 = 二段跳', W/2, 330);
+
+    const btnPulse = 1 + Math.sin(frameCount*0.08)*0.03;
+    ctx.save();
+    ctx.translate(W/2, 394);
+    ctx.scale(btnPulse, btnPulse);
+    const bg = ctx.createLinearGradient(-110,-24,110,24);
+    bg.addColorStop(0,'#ff7b54');
+    bg.addColorStop(1,'#ff4d5e');
+    ctx.fillStyle = bg;
+    roundRect(-110,-24,220,48,24); ctx.fill();
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 20px "Segoe UI","PingFang SC",sans-serif';
+    ctx.fillText('开始游戏', 0, 1);
+    ctx.restore();
+
+    ctx.font = '14px "Segoe UI","PingFang SC",sans-serif';
+    ctx.fillStyle = 'rgba(180,210,255,.6)';
+    ctx.fillText('按 空格 / 回车 或 点击画面开始', W/2, 456);
+    return;
+  }
+
+  if(state.mode === 'knowledge' && currentCard){
+    const c = currentCard;
+    ctx.fillStyle = 'rgba(4,10,24,.62)';
+    ctx.fillRect(0,0,W,H);
+
+    const bw = 660, bh = 300;
+    const bx = (W-bw)/2, by = (H-bh)/2 - 10;
+    const appear = clamp((20 - cardCooldown)/20, 0, 1);
+    const ease = 1 - Math.pow(1-appear, 3);
+
+    ctx.save();
+    ctx.globalAlpha = ease;
+    ctx.translate(0, (1-ease) * 30);
+
+    ctx.fillStyle = 'rgba(0,0,0,.5)';
+    roundRect(bx+6, by+10, bw, bh, 20); ctx.fill();
+
+    ctx.save();
+    roundRect(bx, by, bw, bh, 20); ctx.clip();
+    ctx.fillStyle = '#fffdf6';
+    ctx.fillRect(bx, by, bw, bh);
+    ctx.fillStyle = c.color;
+    ctx.fillRect(bx, by, bw, 62);
+    ctx.globalAlpha = 0.12;
+    ctx.fillStyle = '#fff';
+    for(let i=-60;i<bw+60;i+=26){
+      ctx.beginPath();
+      ctx.moveTo(bx+i, by); ctx.lineTo(bx+i+14, by);
+      ctx.lineTo(bx+i+34, by+62); ctx.lineTo(bx+i+20, by+62);
+      ctx.closePath(); ctx.fill();
+    }
+    ctx.globalAlpha = ease;
+    ctx.restore();
+
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    ctx.font = 'bold 22px "Segoe UI","PingFang SC",sans-serif';
+    ctx.fillStyle = '#fff';
+    ctx.fillText('📚 ' + c.subject + ' · ' + c.title, bx+32, by+32);
+
+    ctx.textAlign = 'center';
+    ctx.font = 'bold 46px "Cambria","Times New Roman",serif';
+    ctx.fillStyle = '#1a2540';
+    ctx.fillText(c.formula, W/2, by + 148);
+
+    ctx.strokeStyle = 'rgba(0,0,0,.1)';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(bx+60, by+196); ctx.lineTo(bx+bw-60, by+196);
+    ctx.stroke();
+
+    ctx.font = '16px "Segoe UI","PingFang SC",sans-serif';
+    ctx.fillStyle = '#4a5568';
+    ctx.fillText(c.desc, W/2, by + 234);
+
+    const blink = 0.5 + 0.5*Math.sin(frameCount*0.12);
+    ctx.font = 'bold 14px "Segoe UI","PingFang SC",sans-serif';
+    ctx.fillStyle = `rgba(43,107,212,${0.35 + blink*0.6})`;
+    ctx.fillText('按任意键 / 点击继续冒险  ▶', W/2, by + bh + 34);
+
+    ctx.restore();
+    return;
+  }
+
+  if(state.mode === 'gameover'){
+    ctx.fillStyle = 'rgba(8,4,16,.8)';
+    ctx.fillRect(0,0,W,H);
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+
+    ctx.font = 'bold 56px "Segoe UI","PingFang SC",sans-serif';
+    ctx.fillStyle = '#ff4d5e';
+    ctx.fillText('GAME OVER', W/2, 170);
+
+    ctx.font = 'bold 24px "Segoe UI","PingFang SC",sans-serif';
+    ctx.fillStyle = '#fff';
+    ctx.fillText('最终得分：' + state.score, W/2, 250);
+
+    ctx.font = '20px "Segoe UI","PingFang SC",sans-serif';
+    ctx.fillStyle = '#ffd93b';
+    ctx.fillText('收集金币：' + state.coinCount + ' 枚', W/2, 292);
+
+    ctx.font = '16px "Segoe UI","PingFang SC",sans-serif';
+    ctx.fillStyle = 'rgba(200,220,255,.75)';
+    ctx.fillText('按 空格 / 回车 或 点击画面 重新开始', W/2, 380);
+    return;
+  }
+
+  if(state.mode === 'win'){
+    ctx.fillStyle = 'rgba(8,20,40,.78)';
+    ctx.fillRect(0,0,W,H);
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+
+    const bob = Math.sin(frameCount*0.06) * 6;
+
+    ctx.save();
+    ctx.shadowColor = 'rgba(255,215,80,.8)';
+    ctx.shadowBlur = 34;
+    ctx.font = 'bold 60px "Segoe UI","PingFang SC",sans-serif';
+    ctx.fillStyle = '#ffd93b';
+    ctx.fillText('🎉 通关成功 🎉', W/2, 150 + bob);
+    ctx.restore();
+
+    ctx.font = 'bold 26px "Segoe UI","PingFang SC",sans-serif';
+    ctx.fillStyle = '#ffffff';
+    ctx.fillText('总得分：' + state.score, W/2, 232);
+
+    ctx.font = '19px "Segoe UI","PingFang SC",sans-serif';
+    ctx.fillStyle = '#8ecbff';
+    ctx.fillText('金币 ' + state.coinCount + ' 枚   剩余生命 ' + state.lives + '   剩余时间 ' + state.time + 's', W/2, 276);
+
+    ctx.font = '16px "Segoe UI","PingFang SC",sans-serif';
+    ctx.fillStyle = 'rgba(255,255,255,.75)';
+    ctx.fillText('你已收集了高中九大学科的核心知识碎片', W/2, 330);
+
+    const blink = 0.5 + 0.5*Math.sin(frameCount*0.1);
+    ctx.font = 'bold 17px "Segoe UI","PingFang SC",sans-serif';
+    ctx.fillStyle = `rgba(255,217,59,${0.4 + blink*0.6})`;
+    ctx.fillText('按 空格 / 回车 或 点击画面 再来一次', W/2, 420);
+    return;
+  }
+}
+
+/* =========================================================================
+   主渲染
+   ========================================================================= */
+function render(){
+  ctx.clearRect(0,0,W,H);
+
+  drawBackground();
+  drawFlag();
+  drawTiles();
+  drawCoins();
+  drawEnemies();
+  drawMario();
+  drawParticles();
+  drawHUD();
+  drawOverlays();
+}
+
+/* =========================================================================
+   主循环
+   ========================================================================= */
+let lastTime = performance.now();
+let accumulator = 0;
+const STEP = 1000 / 60;
+
+function loop(now){
+  requestAnimationFrame(loop);
+
+  let delta = now - lastTime;
+  lastTime = now;
+  if(delta > 120) delta = 120;
+
+  accumulator += delta;
+  let guard = 0;
+  while(accumulator >= STEP && guard < 5){
+    update();
+    accumulator -= STEP;
+    guard++;
+  }
+  if(guard >= 5) accumulator = 0;
+
+  render();
+}
+
+/* =========================================================================
+   启动
+   ========================================================================= */
+buildLevel();
+initEntities();
+resetPlayer();
+
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
